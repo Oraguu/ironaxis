@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iron Axis Bar Path</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --border: #e2e2dc; --grid: #ececE6; --axis: #b9b9b2;
+    --accent: #2f6fdf; --old: #9a9a93; --ok: #2e8b57; --bad: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141414; --surface: #1e1e1e; --text: #ededea; --muted: #9a9a93;
+      --border: #2e2e2c; --grid: #262624; --axis: #4a4a46;
+      --accent: #6aa0ff; --old: #6b6b66; --ok: #5fc48a; --bad: #ff7b6b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 4px 0 12px; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button {
+    font: inherit; padding: 10px 16px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #status { font-size: 14px; color: var(--muted); }
+  #status.ok { color: var(--ok); }
+  #status.bad { color: var(--bad); }
+  .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 16px 0 12px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .stat .label { font-size: 12px; color: var(--muted); }
+  .stat .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  canvas {
+    display: block; width: 100%; aspect-ratio: 1 / 1;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Iron Axis bar path</h1>
+  <div class="bar">
+    <button id="connect" class="primary">Connect</button>
+    <button id="clear">Clear</button>
+    <span id="status">Not connected</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="label">Height</div><div class="value" id="sUp">–</div></div>
+    <div class="stat"><div class="label">Forward</div><div class="value" id="sFwd">–</div></div>
+    <div class="stat"><div class="label">Duration</div><div class="value" id="sDur">–</div></div>
+  </div>
+
+  <canvas id="plot"></canvas>
+  <div class="hint">Side view: forward / back across, height up, in cm. Latest rep in blue, older reps grey. ● start, ■ end.</div>
+
+  <table>
+    <thead><tr><th>Rep</th><th>Height (cm)</th><th>Forward (cm)</th><th>Time (s)</th></tr></thead>
+    <tbody id="reps"></tbody>
+  </table>
+</main>
+
+<script>
+// Nordic UART Service, same IDs as the firmware (Web Bluetooth wants lowercase)
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const MAX_REPS = 10;
+
+const $ = id => document.getElementById(id);
+const canvas = $('plot');
+const ctx = canvas.getContext('2d');
+const decoder = new TextDecoder();
+
+let rxBuffer = '';   // text received but not yet ended by '\n'
+let current = null;  // rep currently arriving
+let reps = [];       // finished reps, newest last
+let repCount = 0;
+
+function setStatus(text, kind) {
+  $('status').textContent = text;
+  $('status').className = kind || '';
+}
+
+// ---------------- Bluetooth ----------------
+$('connect').addEventListener('click', async () => {
+  if (!navigator.bluetooth) {
+    setStatus('No Web Bluetooth here. Open this page in Chrome on Android.', 'bad');
+    return;
+  }
+  try {
+    // Must be triggered by a tap: browsers only show the device picker on a user gesture.
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'IronAxis' }],
+      optionalServices: [NUS_SERVICE],
+    });
+    device.addEventListener('gattserverdisconnected', () => setStatus('Disconnected. Tap Connect to reconnect.', 'bad'));
+    setStatus('Connecting…');
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(NUS_SERVICE);
+    const tx = await service.getCharacteristic(NUS_TX);
+    tx.addEventListener('characteristicvaluechanged', onData);
+    await tx.startNotifications();   // the same as tapping the notify arrows in nRF Connect
+    setStatus('Connected. Do a rep.', 'ok');
+  } catch (err) {
+    setStatus('Not connected: ' + err.message, 'bad');
+  }
+});
+
+// Packets can split a line or hold several, so collect text and only
+// handle complete lines (ending in '\n').
+function onData(event) {
+  rxBuffer += decoder.decode(event.target.value);
+  let nl;
+  while ((nl = rxBuffer.indexOf('\n')) >= 0) {
+    handleLine(rxBuffer.slice(0, nl).trim());
+    rxBuffer = rxBuffer.slice(nl + 1);
+  }
+}
+
+function handleLine(line) {
+  if (line.startsWith('R,')) {
+    const [up, fwd, dur] = line.slice(2).split(',').map(Number);
+    current = { up, fwd, dur, pts: [[0, 0]] };   // every rep starts at the origin
+  } else if (line.startsWith('P,') && current) {
+    for (const pair of line.slice(2).split(';')) {
+      const [x, z] = pair.split(',').map(Number);
+      if (Number.isFinite(x) && Number.isFinite(z)) current.pts.push([x, z]);
+    }
+  } else if (line === 'E' && current) {
+    current.n = ++repCount;
+    reps.push(current);
+    reps = reps.slice(-MAX_REPS);
+    current = null;
+    showRep(reps[reps.length - 1]);
+    render();
+  } else if (line === 'ready') {
+    setStatus('Connected, board calibrated. Do a rep.', 'ok');
+  }
+}
+
+$('clear').addEventListener('click', () => {
+  reps = [];
+  $('sUp').textContent = $('sFwd').textContent = $('sDur').textContent = '–';
+  $('reps').innerHTML = '';
+  render();
+});
+
+function showRep(rep) {
+  const fmt = v => (v >= 0 ? '+' : '') + v.toFixed(1);
+  $('sUp').textContent = fmt(rep.up);
+  $('sFwd').textContent = fmt(rep.fwd);
+  $('sDur').textContent = rep.dur.toFixed(2);
+  $('reps').innerHTML = reps.slice().reverse().map(r =>
+    `<tr><td>${r.n}</td><td>${fmt(r.up)}</td><td>${fmt(r.fwd)}</td><td>${r.dur.toFixed(2)}</td></tr>`
+  ).join('');
+}
+
+// ---------------- Drawing ----------------
+// Convert a point in cm (x = forward, z = up) to a pixel position on the canvas.
+// view.minX / view.minZ: the cm values at the left and bottom edges of the plot area
+// view.scale:            pixels per cm (the same on both axes, so shapes aren't stretched)
+// view.pad:              empty margin around the plot area, in pixels
+// view.height:           canvas height in pixels
+// Return [px, py].
+function toScreen(x, z, view) {
+  const px = view.pad + (x - view.minX) * view.scale;
+  // Canvas y counts down from the top, but height goes up, so start at the
+  // bottom of the plot area and subtract.
+  const py = view.height - view.pad - (z - view.minZ) * view.scale;
+  return [px, py];
+}
+
+function css(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function render() {
+  // Draw at the screen's real pixel density so lines stay sharp on a phone.
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  // Bounds of everything we'll draw, always including the origin and at least 20 cm across.
+  let minX = 0, maxX = 0, minZ = 0, maxZ = 0;
+  for (const r of reps) for (const [x, z] of r.pts) {
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+  }
+  const span = Math.max(maxX - minX, maxZ - minZ, 20) * 1.15;
+  const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+  const pad = 28;
+  const scale = (Math.min(w, h) - 2 * pad) / span;
+  const view = { minX: cx - span / 2, minZ: cz - span / 2, scale, pad, height: h };
+
+  // Grid every 5 or 10 cm, depending on zoom.
+  const step = span > 60 ? 10 : 5;
+  ctx.lineWidth = 1;
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.fillStyle = css('--muted');
+  for (let v = Math.ceil(view.minX / step) * step; v <= view.minX + span; v += step) {
+    const [px] = toScreen(v, 0, view);
+    ctx.strokeStyle = v === 0 ? css('--axis') : css('--grid');
+    ctx.beginPath(); ctx.moveTo(px, pad); ctx.lineTo(px, h - pad); ctx.stroke();
+    ctx.fillText(v, px + 2, h - pad + 14);
+  }
+  for (let v = Math.ceil(view.minZ / step) * step; v <= view.minZ + span; v += step) {
+    const [, py] = toScreen(0, v, view);
+    ctx.strokeStyle = v === 0 ? css('--axis') : css('--grid');
+    ctx.beginPath(); ctx.moveTo(pad, py); ctx.lineTo(w - pad, py); ctx.stroke();
+    ctx.fillText(v, 4, py - 2);
+  }
+
+  if (reps.length === 0) {
+    ctx.fillStyle = css('--muted');
+    ctx.font = '14px system-ui, sans-serif';
+    ctx.fillText('Waiting for a rep…', pad + 8, pad + 20);
+    return;
+  }
+
+  reps.forEach((rep, i) => {
+    const latest = i === reps.length - 1;
+    const color = latest ? css('--accent') : css('--old');
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.globalAlpha = latest ? 1 : 0.45;
+    ctx.lineWidth = latest ? 3 : 1.5;
+    ctx.lineJoin = 'round';
+
+    ctx.beginPath();
+    rep.pts.forEach(([x, z], k) => {
+      const [px, py] = toScreen(x, z, view);
+      if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+
+    const [sx, sy] = toScreen(...rep.pts[0], view);
+    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 2 * Math.PI); ctx.fill();         // start
+    const [ex, ey] = toScreen(...rep.pts[rep.pts.length - 1], view);
+    ctx.fillRect(ex - 4, ey - 4, 8, 8);                                        // end
+  });
+  ctx.globalAlpha = 1;
+}
+
+window.addEventListener('resize', render);
+render();
+</script>
+</body>
+</html>
