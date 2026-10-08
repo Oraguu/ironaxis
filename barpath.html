@@ -58,16 +58,16 @@
   </div>
 
   <div class="stats">
-    <div class="stat"><div class="label">Height</div><div class="value" id="sUp">–</div></div>
-    <div class="stat"><div class="label">Forward</div><div class="value" id="sFwd">–</div></div>
-    <div class="stat"><div class="label">Duration</div><div class="value" id="sDur">–</div></div>
+    <div class="stat"><div class="label">Range</div><div class="value" id="sRom">–</div></div>
+    <div class="stat"><div class="label">Sway</div><div class="value" id="sSway">–</div></div>
+    <div class="stat"><div class="label">Time</div><div class="value" id="sDur">–</div></div>
   </div>
 
   <canvas id="plot"></canvas>
-  <div class="hint">Side view: forward / back across, height up, in cm. Latest rep in blue, older reps grey. ● start, ■ end.</div>
+  <div class="hint">Side view, in cm: forward / back across, height up. Each full rep (down and up, even with a pause) is one line. Latest rep in blue, older reps grey, a rep still in progress dashed. ● start, ■ end. Range = top to bottom, sway = how far the bar drifted forward/back.</div>
 
   <table>
-    <thead><tr><th>Rep</th><th>Height (cm)</th><th>Forward (cm)</th><th>Time (s)</th></tr></thead>
+    <thead><tr><th>Rep</th><th>Range (cm)</th><th>Sway (cm)</th><th>Time (s)</th></tr></thead>
     <tbody id="reps"></tbody>
   </table>
 </main>
@@ -83,8 +83,19 @@ const canvas = $('plot');
 const ctx = canvas.getContext('2d');
 const decoder = new TextDecoder();
 
+// The board sends one *segment* per stretch of movement between still
+// pauses. A paused rep (down, pause, up) arrives as two segments, so the page
+// joins segments into full reps:
+const MIN_ROM = 10;        // cm: the bar must travel at least this far for it to count as a rep
+const RETURN_TOL = 0.25;   // the rep is finished once the bar is back within 25% of its range of the start...
+const RETURN_MIN = 4;      // ...or within 4 cm, whichever is bigger
+const MAX_GAP_S = 3;       // a pause longer than this ends whatever rep was in progress
+const MAX_SEGMENTS = 3;    // a full rep never needs more segments than this
+const STILL_LAG_S = 0.5;   // the firmware's still window: each segment's duration includes it
+
 let rxBuffer = '';   // text received but not yet ended by '\n'
-let current = null;  // rep currently arriving
+let current = null;  // segment currently arriving
+let open = null;     // rep being put together from segments
 let reps = [];       // finished reps, newest last
 let repCount = 0;
 
@@ -132,38 +143,81 @@ function onData(event) {
 function handleLine(line) {
   if (line.startsWith('R,')) {
     const [up, fwd, dur] = line.slice(2).split(',').map(Number);
-    current = { up, fwd, dur, pts: [[0, 0]] };   // every rep starts at the origin
+    current = { up, fwd, dur, pts: [[0, 0]], t: Date.now() / 1000 };   // every segment starts at its own origin
   } else if (line.startsWith('P,') && current) {
     for (const pair of line.slice(2).split(';')) {
       const [x, z] = pair.split(',').map(Number);
       if (Number.isFinite(x) && Number.isFinite(z)) current.pts.push([x, z]);
     }
   } else if (line === 'E' && current) {
-    current.n = ++repCount;
-    reps.push(current);
-    reps = reps.slice(-MAX_REPS);
+    addSegment(current);
     current = null;
-    showRep(reps[reps.length - 1]);
     render();
   } else if (line === 'ready') {
     setStatus('Connected, board calibrated. Do a rep.', 'ok');
   }
 }
 
+// ---------------- Joining segments into reps ----------------
+function addSegment(seg) {
+  // seg.t is when the segment *arrived*, after its still lag. Work back to
+  // when it actually started and stopped moving.
+  const start = seg.t - seg.dur;
+  const stop  = seg.t - STILL_LAG_S;
+
+  // A long pause since the last segment means the previous rep is over,
+  // even if it never made it back to the start.
+  if (open && start - open.stopT > MAX_GAP_S) closeRep();
+
+  if (!open) open = { pts: [[0, 0]], startT: start, stopT: stop, segments: 0 };
+
+  // Chain: this segment starts where the previous one ended.
+  const [ox, oz] = open.pts[open.pts.length - 1];
+  for (const [x, z] of seg.pts.slice(1)) open.pts.push([x + ox, z + oz]);
+  open.stopT = stop;
+  open.segments++;
+
+  // Back near the start after a real movement? Then the rep is done.
+  const zs = open.pts.map(p => p[1]);
+  const rom = Math.max(...zs) - Math.min(...zs);
+  const offset = Math.abs(zs[zs.length - 1]);
+  const back = offset <= Math.max(RETURN_MIN, RETURN_TOL * rom);
+  if ((rom >= MIN_ROM && back) || open.segments >= MAX_SEGMENTS) closeRep();
+}
+
+function closeRep() {
+  if (!open) return;
+  const xs = open.pts.map(p => p[0]), zs = open.pts.map(p => p[1]);
+  const rom = Math.max(...zs) - Math.min(...zs);
+  if (rom >= MIN_ROM) {   // drop small fidgets that never turned into a rep
+    reps.push({
+      n: ++repCount,
+      pts: open.pts,
+      rom,
+      sway: Math.max(...xs) - Math.min(...xs),
+      dur: open.stopT - open.startT,
+    });
+    reps = reps.slice(-MAX_REPS);
+    showReps();
+  }
+  open = null;
+}
+
 $('clear').addEventListener('click', () => {
   reps = [];
-  $('sUp').textContent = $('sFwd').textContent = $('sDur').textContent = '–';
+  open = null;
+  $('sRom').textContent = $('sSway').textContent = $('sDur').textContent = '–';
   $('reps').innerHTML = '';
   render();
 });
 
-function showRep(rep) {
-  const fmt = v => (v >= 0 ? '+' : '') + v.toFixed(1);
-  $('sUp').textContent = fmt(rep.up);
-  $('sFwd').textContent = fmt(rep.fwd);
-  $('sDur').textContent = rep.dur.toFixed(2);
+function showReps() {
+  const last = reps[reps.length - 1];
+  $('sRom').textContent = last.rom.toFixed(1);
+  $('sSway').textContent = last.sway.toFixed(1);
+  $('sDur').textContent = last.dur.toFixed(2);
   $('reps').innerHTML = reps.slice().reverse().map(r =>
-    `<tr><td>${r.n}</td><td>${fmt(r.up)}</td><td>${fmt(r.fwd)}</td><td>${r.dur.toFixed(2)}</td></tr>`
+    `<tr><td>${r.n}</td><td>${r.rom.toFixed(1)}</td><td>${r.sway.toFixed(1)}</td><td>${r.dur.toFixed(2)}</td></tr>`
   ).join('');
 }
 
@@ -195,9 +249,13 @@ function render() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
+  // Everything to draw: finished reps, plus the rep still being put together.
+  const paths = reps.map((r, i) => ({ pts: r.pts, style: i === reps.length - 1 && !open ? 'latest' : 'old' }));
+  if (open) paths.push({ pts: open.pts, style: 'open' });
+
   // Bounds of everything we'll draw, always including the origin and at least 20 cm across.
   let minX = 0, maxX = 0, minZ = 0, maxZ = 0;
-  for (const r of reps) for (const [x, z] of r.pts) {
+  for (const p of paths) for (const [x, z] of p.pts) {
     minX = Math.min(minX, x); maxX = Math.max(maxX, x);
     minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
   }
@@ -225,34 +283,35 @@ function render() {
     ctx.fillText(v, 4, py - 2);
   }
 
-  if (reps.length === 0) {
+  if (paths.length === 0) {
     ctx.fillStyle = css('--muted');
     ctx.font = '14px system-ui, sans-serif';
     ctx.fillText('Waiting for a rep…', pad + 8, pad + 20);
     return;
   }
 
-  reps.forEach((rep, i) => {
-    const latest = i === reps.length - 1;
-    const color = latest ? css('--accent') : css('--old');
+  for (const { pts, style } of paths) {
+    const color = style === 'old' ? css('--old') : css('--accent');
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
-    ctx.globalAlpha = latest ? 1 : 0.45;
-    ctx.lineWidth = latest ? 3 : 1.5;
+    ctx.globalAlpha = style === 'old' ? 0.45 : 1;
+    ctx.lineWidth = style === 'old' ? 1.5 : 3;
     ctx.lineJoin = 'round';
+    ctx.setLineDash(style === 'open' ? [6, 5] : []);   // dashed = rep not finished yet
 
     ctx.beginPath();
-    rep.pts.forEach(([x, z], k) => {
+    pts.forEach(([x, z], k) => {
       const [px, py] = toScreen(x, z, view);
       if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
     });
     ctx.stroke();
+    ctx.setLineDash([]);
 
-    const [sx, sy] = toScreen(...rep.pts[0], view);
-    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 2 * Math.PI); ctx.fill();         // start
-    const [ex, ey] = toScreen(...rep.pts[rep.pts.length - 1], view);
-    ctx.fillRect(ex - 4, ey - 4, 8, 8);                                        // end
-  });
+    const [sx, sy] = toScreen(...pts[0], view);
+    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 2 * Math.PI); ctx.fill();   // start
+    const [ex, ey] = toScreen(...pts[pts.length - 1], view);
+    ctx.fillRect(ex - 4, ey - 4, 8, 8);                                  // end
+  }
   ctx.globalAlpha = 1;
 }
 
